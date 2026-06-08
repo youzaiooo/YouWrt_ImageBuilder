@@ -216,4 +216,289 @@ else
     echo "未检测到 Docker，跳过防火墙配置。"
 fi
 
+# 从 backup-YouzaiWrt-2026-06-08 迁移的通用默认配置。
+# 跳过密码、证书、Tailscale 状态、DDNS 账号、私网路由和设备专用 IPv6 地址。
+echo "Applying migrated YouzaiWrt defaults..." >>$LOGFILE
+
+# 系统基础设置
+uci set system.@system[0].hostname='YouzaiWrt'
+uci set system.@system[0].timezone='CST-8'
+uci set system.@system[0].zonename='Asia/Shanghai'
+uci set system.@system[0].log_size='128'
+uci set system.@system[0].ttylogin='0'
+uci -q delete system.ntp.server
+uci add_list system.ntp.server='ntp.tencent.com'
+uci add_list system.ntp.server='ntp1.aliyun.com'
+uci add_list system.ntp.server='ntp.ntsc.ac.cn'
+uci add_list system.ntp.server='cn.ntp.org.cn'
+uci commit system
+
+# 多网口默认管理地址沿用备份值；如果构建流程写入了 custom_router_ip.txt，则尊重上面的已有逻辑。
+if [ "$count" -gt 1 ] && [ ! -f /etc/config/custom_router_ip.txt ]; then
+    uci set network.lan.ipaddr='192.168.10.254'
+    echo "backup router ip is 192.168.10.254" >>$LOGFILE
+fi
+
+# 网络通用优化。wan6 使用 @wan 便于跟随 WAN 口协议和设备变化。
+uci set network.globals.packet_steering='1'
+uci set network.lan.ip6assign='64'
+uci set network.lan.ipv6='1'
+uci set network.lan.ip6ifaceid='eui64'
+uci set network.wan.metric='11'
+if [ "${enable_pppoe:-}" != "yes" ]; then
+    uci set network.wan6.device='@wan'
+    uci -q delete network.wan6.ifname
+    uci set network.wan6.proto='dhcpv6'
+    uci set network.wan6.metric='11'
+    uci set network.wan6.requery='3600'
+    uci set network.wan6.force_link='1'
+    uci set network.wan6.reqaddress='try'
+    uci set network.wan6.reqprefix='auto'
+    uci set network.wan6.extendprefix='1'
+fi
+if uci -q get network.docker >/dev/null 2>&1 || [ -e /etc/init.d/dockerd ]; then
+    uci set network.docker=interface
+    uci set network.docker.device='docker0'
+    uci set network.docker.proto='none'
+    uci set network.docker.auto='0'
+    if ! uci -q show network | grep -q "name='docker0'"; then
+        uci add network device
+        uci set network.@device[-1].type='bridge'
+        uci set network.@device[-1].name='docker0'
+    fi
+fi
+if command -v tailscaled >/dev/null 2>&1 || [ -e /etc/init.d/tailscale ]; then
+    uci set network.tailscale=interface
+    uci set network.tailscale.proto='none'
+    uci set network.tailscale.device='tailscale0'
+fi
+uci commit network
+
+# DHCP/DNS 默认值，来自备份中的 dnsmasq 缓存与 IPv6 RA 设置。
+uci set dhcp.@dnsmasq[0].min_cache_ttl='3600'
+uci set dhcp.@dnsmasq[0].use_stale_cache='3600'
+uci set dhcp.@dnsmasq[0].cachesize='8000'
+uci set dhcp.@dnsmasq[0].nonegcache='1'
+uci set dhcp.@dnsmasq[0].ednspacket_max='1232'
+uci set dhcp.@dnsmasq[0].localuse='1'
+uci set dhcp.@dnsmasq[0].noresolv='0'
+uci set dhcp.@dnsmasq[0].dns_redirect='0'
+uci set dhcp.@dnsmasq[0].resolvfile='/tmp/resolv.conf.d/resolv.conf.auto'
+uci set dhcp.lan.dhcpv4='server'
+uci set dhcp.lan.dhcpv6='disabled'
+uci set dhcp.lan.ra='server'
+uci set dhcp.lan.ra_slaac='1'
+uci -q delete dhcp.lan.ra_flags
+uci add_list dhcp.lan.ra_flags='other-config'
+uci set dhcp.lan.max_preferred_lifetime='2700'
+uci set dhcp.lan.max_valid_lifetime='5400'
+uci commit dhcp
+
+# Dropbear 保持密码登录可用，但不写入任何 root 密码或 shadow 内容。
+uci set dropbear.@dropbear[0].enable='1'
+uci set dropbear.@dropbear[0].PasswordAuth='on'
+uci set dropbear.@dropbear[0].RootPasswordAuth='on'
+uci set dropbear.@dropbear[0].Port='22'
+uci set dropbear.@dropbear[0].Interface=''
+uci commit dropbear
+
+# TTYD 不绑定单一接口，便于首次启动后从 LAN/WAN 管理面进入终端。
+if uci -q get ttyd.@ttyd[0] >/dev/null 2>&1; then
+    uci -q delete ttyd.@ttyd[0].interface
+    uci commit ttyd
+fi
+
+# 兼容 OpenWrt 25.12+：不在首次启动脚本中使用 opkg；如需包操作，优先使用 apk。
+if command -v apk >/dev/null 2>&1; then
+    echo "apk package manager detected." >>$LOGFILE
+elif command -v opkg >/dev/null 2>&1; then
+    echo "opkg package manager detected." >>$LOGFILE
+fi
+
+# Docker 默认数据目录和防火墙网络归属。
+if [ -e /etc/init.d/dockerd ] || command -v dockerd >/dev/null 2>&1; then
+    uci -q get dockerd.globals >/dev/null 2>&1 || uci set dockerd.globals=globals
+    uci -q get dockerd.dockerman >/dev/null 2>&1 || uci set dockerd.dockerman=dockerman
+    uci set dockerd.globals.data_root='/opt/docker/'
+    uci set dockerd.globals.log_level='warn'
+    uci set dockerd.globals.iptables='1'
+    uci set dockerd.globals.auto_start='1'
+    uci set dockerd.dockerman.socket_path='/var/run/docker.sock'
+    uci set dockerd.dockerman.status_path='/tmp/.docker_action_status'
+    uci set dockerd.dockerman.debug='false'
+    uci set dockerd.dockerman.debug_path='/tmp/.docker_debug'
+    uci set dockerd.dockerman.remote_endpoint='0'
+    uci -q delete dockerd.dockerman.ac_allowed_interface
+    uci add_list dockerd.dockerman.ac_allowed_interface='br-lan'
+    uci commit dockerd
+
+    uci -q delete firewall.docker.network
+    uci add_list firewall.docker.network='docker'
+    uci commit firewall
+fi
+
+# Tailscale 只迁移通用运行参数，不迁移 tailscaled.state 或私网路由广播。
+if [ -e /etc/init.d/tailscale ] || command -v tailscaled >/dev/null 2>&1; then
+    uci -q get tailscale.settings >/dev/null 2>&1 || uci set tailscale.settings=settings
+    uci set tailscale.settings.log_stderr='1'
+    uci set tailscale.settings.log_stdout='1'
+    uci set tailscale.settings.port='41641'
+    uci set tailscale.settings.state_file='/etc/tailscale/tailscaled.state'
+    uci set tailscale.settings.fw_mode='nftables'
+    uci set tailscale.settings.service_enabled='1'
+    uci set tailscale.settings.accept_routes='1'
+    uci set tailscale.settings.advertise_exit_node='0'
+    uci set tailscale.settings.exit_node_allow_lan_access='1'
+    uci set tailscale.settings.runwebclient='1'
+    uci set tailscale.settings.nosnat='0'
+    uci set tailscale.settings.shields_up='0'
+    uci set tailscale.settings.ssh='0'
+    uci set tailscale.settings.disable_magic_dns='1'
+    uci set tailscale.settings.enable_relay='1'
+    uci set tailscale.settings.relay_server_port='42333'
+    uci -q delete tailscale.settings.advertise_routes
+    uci commit tailscale
+
+    uci -q delete firewall.tailscale
+    uci set firewall.tailscale=zone
+    uci set firewall.tailscale.name='tailscale'
+    uci set firewall.tailscale.input='ACCEPT'
+    uci set firewall.tailscale.output='ACCEPT'
+    uci set firewall.tailscale.forward='ACCEPT'
+    uci set firewall.tailscale.mtu_fix='1'
+    uci add_list firewall.tailscale.network='tailscale'
+    uci commit firewall
+fi
+
+# ddns-go 只启用监听参数，账号和域名配置需要首次登录后手工导入。
+if [ -e /etc/init.d/ddns-go ] || command -v ddns-go >/dev/null 2>&1; then
+    uci set ddns-go.config=ddns-go
+    uci set ddns-go.config.enabled='1'
+    uci set ddns-go.config.listen='[::]:9876'
+    uci set ddns-go.config.ttl='300'
+    uci set ddns-go.config.insecure='1'
+    uci commit ddns-go
+fi
+
+# Argon 主题偏好。
+if [ -f /etc/config/argon ]; then
+    uci -q get argon.global >/dev/null 2>&1 || uci set argon.global=global
+    uci set argon.global.primary='#5e72e4'
+    uci set argon.global.dark_primary='#483d8b'
+    uci set argon.global.blur='0'
+    uci set argon.global.blur_dark='0'
+    uci set argon.global.transparency='0.3'
+    uci set argon.global.transparency_dark='0.3'
+    uci set argon.global.mode='normal'
+    uci set argon.global.online_wallpaper='bing'
+    uci commit argon
+fi
+
+# Bandix 基础界面参数。
+if [ -f /etc/config/bandix ]; then
+    uci -q get bandix.general >/dev/null 2>&1 || uci set bandix.general=bandix
+    uci -q get bandix.traffic >/dev/null 2>&1 || uci set bandix.traffic=bandix
+    uci -q get bandix.connections >/dev/null 2>&1 || uci set bandix.connections=bandix
+    uci -q get bandix.dns >/dev/null 2>&1 || uci set bandix.dns=bandix
+    uci set bandix.general.iface='br-lan'
+    uci set bandix.general.port='8686'
+    uci set bandix.general.data_dir='/usr/share/bandix'
+    uci set bandix.general.language='auto'
+    uci set bandix.general.theme='auto'
+    uci set bandix.general.log_level='info'
+    uci set bandix.traffic.enabled='0'
+    uci set bandix.connections.enabled='0'
+    uci set bandix.dns.enabled='0'
+    uci commit bandix
+fi
+
+# 迁移 IPv6 LAN 路由修复脚本。此脚本不包含设备地址，按运行时 br-lan 前缀动态处理。
+mkdir -p /etc/odhcp6c.user.d
+cat >/root/fix_ipv6_lan_routes.sh <<'EOF'
+#!/bin/sh
+set -eu
+
+LAN_IF="${LAN_IF:-br-lan}"
+METRIC="${METRIC:-100}"
+PUBLIC_SRC="${PUBLIC_SRC:-2000::/3}"
+ACTION="${1:-apply}"
+
+find_prefixes() {
+    ip -6 route show table main dev "$LAN_IF" 2>/dev/null |
+        awk '$1 ~ /^[23][0-9a-fA-F:]*\/[0-9]+$/ { print $1 }' |
+        sort -u
+}
+
+apply_routes() {
+    prefixes="$(find_prefixes)"
+    [ -n "$prefixes" ] || {
+        echo "No global IPv6 prefix found on $LAN_IF" >&2
+        exit 1
+    }
+    for prefix in $prefixes; do
+        echo "Applying routes for $prefix on $LAN_IF metric $METRIC"
+        ip -6 route replace "$prefix" dev "$LAN_IF" metric "$METRIC"
+        ip -6 route replace "$prefix" from "$prefix" dev "$LAN_IF" metric "$METRIC"
+        ip -6 route replace "$prefix" from "$PUBLIC_SRC" dev "$LAN_IF" metric "$METRIC"
+    done
+}
+
+delete_routes() {
+    prefixes="$(find_prefixes)"
+    [ -n "$prefixes" ] || {
+        echo "No global IPv6 prefix found on $LAN_IF" >&2
+        exit 1
+    }
+    for prefix in $prefixes; do
+        echo "Deleting routes for $prefix on $LAN_IF metric $METRIC"
+        ip -6 route del "$prefix" dev "$LAN_IF" metric "$METRIC" 2>/dev/null || true
+        ip -6 route del "$prefix" from "$prefix" dev "$LAN_IF" metric "$METRIC" 2>/dev/null || true
+        ip -6 route del "$prefix" from "$PUBLIC_SRC" dev "$LAN_IF" metric "$METRIC" 2>/dev/null || true
+    done
+}
+
+case "$ACTION" in
+    apply|add|fix)
+        apply_routes
+        ;;
+    delete|del|remove)
+        delete_routes
+        ;;
+    show|status)
+        ip -6 route show table main dev "$LAN_IF"
+        ;;
+    *)
+        echo "Usage: $0 [apply|delete|show]" >&2
+        exit 2
+        ;;
+esac
+EOF
+chmod 0755 /root/fix_ipv6_lan_routes.sh
+
+cat >/etc/odhcp6c.user.d/99-fix-ipv6-lan-routes <<'EOF'
+#!/bin/sh
+
+[ "$INTERFACE" = "wan6" ] || exit 0
+
+case "$2" in
+    bound|informed|updated|rebound|ra-updated)
+        (
+            i=0
+            while [ "$i" -lt 10 ]; do
+                logger -t fix-ipv6-lan-routes "event=$2 interface=$INTERFACE apply attempt=$((i + 1))"
+                if /root/fix_ipv6_lan_routes.sh apply 2>&1 | logger -t fix-ipv6-lan-routes; then
+                    exit 0
+                fi
+                i=$((i + 1))
+                sleep 2
+            done
+            logger -t fix-ipv6-lan-routes "failed after retries"
+        ) &
+        ;;
+esac
+EOF
+chmod 0755 /etc/odhcp6c.user.d/99-fix-ipv6-lan-routes
+
+echo "Migrated YouzaiWrt defaults finished." >>$LOGFILE
+
 exit 0
